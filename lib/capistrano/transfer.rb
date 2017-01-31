@@ -2,6 +2,7 @@ require 'net/scp'
 require 'net/sftp'
 
 require 'capistrano/processable'
+require 'open3'
 
 module Capistrano
   class Transfer
@@ -31,7 +32,7 @@ module Capistrano
       @options   = options
       @callback  = block
 
-      @transport = options.fetch(:via, :sftp)
+      @transport = options.fetch(:via, :native_scp)
       @logger    = options.delete(:logger)
 
       @session_map = {}
@@ -93,124 +94,179 @@ module Capistrano
 
     private
 
-      def session_map
-        @session_map
+    def session_map
+      @session_map
+    end
+
+    def prepare_transfers
+      logger.info "#{transport} #{operation} #{from} -> #{to}" if logger
+      @transfers = sessions.map do |session|
+        session_from = normalize(from, session)
+        session_to   = normalize(to, session)
+
+        session_map[session] = case transport
+                                 when :sftp
+                                   prepare_sftp_transfer(session_from, session_to, session)
+                                 when :scp
+                                   prepare_scp_transfer(session_from, session_to, session)
+                                 when :native_scp
+                                   NativeSCPTransferWrapper.new(session_from, session_to, session, direction, logger)
+                                 else
+                                   raise ArgumentError, "unsupported transport type: #{transport.inspect}"
+                               end
       end
+    end
 
-      def prepare_transfers
-        logger.info "#{transport} #{operation} #{from} -> #{to}" if logger
+    class NativeSCPTransferWrapper
+      attr_reader :operation
 
-        @transfers = sessions.map do |session|
-          session_from = normalize(from, session)
-          session_to   = normalize(to, session)
-
-          session_map[session] = case transport
-            when :sftp
-              prepare_sftp_transfer(session_from, session_to, session)
-            when :scp
-              prepare_scp_transfer(session_from, session_to, session)
-            else
-              raise ArgumentError, "unsupported transport type: #{transport.inspect}"
-            end
-        end
-      end
-
-      def prepare_scp_transfer(from, to, session)
-        real_callback = callback || Proc.new do |channel, name, sent, total|
-          logger.trace "[#{channel[:host]}] #{name}" if logger && sent == 0
-        end
-
-        channel = case direction
+      def initialize(session_from, session_to, session, direction, logger)
+        @operation = {:t => ''}
+        host = session.xserver.host
+        password = session.options[:password]
+        user = session.options[:user]
+        port = session.options[:port]
+        keys = session.options[:keys]
+        case direction
           when :up
-            session.scp.upload(from, to, options, &real_callback)
+            cmd = "SSHPASS='#{password}' sshpass -e scp -P #{port} -i #{keys} #{session_from} #{user}@#{host}:#{session_to}"
           when :down
-            session.scp.download(from, to, options, &real_callback)
+            cmd = "SSHPASS='#{password}' sshpass -e scp -P #{port} -i #{keys} #{user}@#{host}:#{session_from} #{session_to}"
           else
             raise ArgumentError, "unsupported transfer direction: #{direction.inspect}"
+        end
+
+        Open3.popen3(cmd) do |stdin, stdout, stderr|
+          stdin.close
+          error = stderr.read
+          logger.info "Command: #{cmd}"
+          if error.nil? and error.empty?
+            error_msg = "Error when uploading: #{error}\nCommand: #{cmd}"
+            error = Exception.new(error_msg)
+            @operation[:failed] = true
+            @operation[:error] = error
+            logger.error error_msg
           end
+        end
 
-        channel[:server] = session.xserver
-        channel[:host]   = session.xserver.host
-
-        return channel
+        # output = `#{cmd}`
+        # logger.info cmd
+        #logger.info output
+        # logger.info "Finished"
       end
 
-      class SFTPTransferWrapper
-        attr_reader :operation
+      def active?
+        false
+      end
 
-        def initialize(session, &callback)
-          session.sftp(false).connect do |sftp|
-            @operation = callback.call(sftp)
-          end
-        end
+      def [](key)
+        @operation[key]
+      end
 
-        def active?
-          @operation.nil? || @operation.active?
-        end
+      def []=(key, value)
+        @operation[key] = value
+      end
 
-        def [](key)
-          @operation[key]
-        end
+      def abort!
+      end
+    end
 
-        def []=(key, value)
-          @operation[key] = value
-        end
+    def prepare_scp_transfer(from, to, session)
+      real_callback = callback || Proc.new do |channel, name, sent, total|
+        logger.trace "[#{channel[:host]}] #{name}" if logger && sent == 0
+      end
 
-        def abort!
-          @operation.abort!
+      channel = case direction
+                  when :up
+                    session.scp.upload(from, to, options, &real_callback)
+                  when :down
+                    session.scp.download(from, to, options, &real_callback)
+                  else
+                    raise ArgumentError, "unsupported transfer direction: #{direction.inspect}"
+                end
+
+      channel[:server] = session.xserver
+      channel[:host]   = session.xserver.host
+
+      return channel
+    end
+
+    class SFTPTransferWrapper
+      attr_reader :operation
+
+      def initialize(session, &callback)
+        session.sftp(false).connect do |sftp|
+          @operation = callback.call(sftp)
         end
       end
 
-      def prepare_sftp_transfer(from, to, session)
-        SFTPTransferWrapper.new(session) do |sftp|
-          real_callback = Proc.new do |event, op, *args|
-            if callback
-              callback.call(event, op, *args)
-            elsif event == :open
-              logger.trace "[#{op[:host]}] #{args[0].remote}"
-            elsif event == :finish
-              logger.trace "[#{op[:host]}] done"
-            end
-          end
+      def active?
+        @operation.nil? || @operation.active?
+      end
 
-          opts = options.dup
-          opts[:properties] = (opts[:properties] || {}).merge(
+      def [](key)
+        @operation[key]
+      end
+
+      def []=(key, value)
+        @operation[key] = value
+      end
+
+      def abort!
+        @operation.abort!
+      end
+    end
+
+    def prepare_sftp_transfer(from, to, session)
+      SFTPTransferWrapper.new(session) do |sftp|
+        real_callback = Proc.new do |event, op, *args|
+          if callback
+            callback.call(event, op, *args)
+          elsif event == :open
+            logger.trace "[#{op[:host]}] #{args[0].remote}"
+          elsif event == :finish
+            logger.trace "[#{op[:host]}] done"
+          end
+        end
+
+        opts = options.dup
+        opts[:properties] = (opts[:properties] || {}).merge(
             :server  => session.xserver,
             :host    => session.xserver.host)
 
-          case direction
+        case direction
           when :up
             sftp.upload(from, to, opts, &real_callback)
           when :down
             sftp.download(from, to, opts, &real_callback)
           else
             raise ArgumentError, "unsupported transfer direction: #{direction.inspect}"
-          end
         end
       end
+    end
 
-      def normalize(argument, session)
-        if argument.is_a?(String)
-          argument.gsub(/\$CAPISTRANO:HOST\$/, session.xserver.host)
-        elsif argument.respond_to?(:read)
-          pos = argument.pos
-          clone = StringIO.new(argument.read)
-          clone.pos = argument.pos = pos
-          clone
-        else
-          argument
-        end
+    def normalize(argument, session)
+      if argument.is_a?(String)
+        argument.gsub(/\$CAPISTRANO:HOST\$/, session.xserver.host)
+      elsif argument.respond_to?(:read)
+        pos = argument.pos
+        clone = StringIO.new(argument.read)
+        clone.pos = argument.pos = pos
+        clone
+      else
+        argument
       end
+    end
 
-      def handle_error(error)
-        transfer = session_map[error.session]
-        transfer[:error] = error
-        transfer[:failed] = true
+    def handle_error(error)
+      transfer = session_map[error.session]
+      transfer[:error] = error
+      transfer[:failed] = true
 
-        case transport
+      case transport
         when :sftp then transfer.abort!
         when :scp  then transfer.close
-        end
       end
+    end
   end
 end
